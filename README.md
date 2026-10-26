@@ -26,7 +26,8 @@ Anything else is rejected. The app does not fetch the URL you paste. Upstream re
 ## Data sources (all free, no key)
 
 - Gamma `/markets/{id}` or `/markets/slug/{slug}`: metadata, outcomePrices, volume, UMA status. The list endpoint `/markets?slug=` returns open markets only; `closed=true` returns closed markets only. `/markets/slug/{slug}` works for both.
-- CLOB `/book?token_id=` for both outcome tokens, plus `/prices-history` (a `startTs`/`endTs` range, falling back to `interval=max`)
+- CLOB `/book?token_id=` for both outcome tokens
+- Data API v2 `/v2/prices-history?token_id=` (cursor pages; `bucket_seconds` 60, then 300, then 1800, then `interval=max`)
 - Data API `/trades?market=` with `takerOnly=true` and `takerOnly=false` (paginated), `/oi`, `/holders`
 
 ## Belief rules
@@ -37,7 +38,7 @@ Anything else is rejected. The app does not fetch the URL you paste. Upstream re
 4. Trade estimate: price weighted by USD × phase (pre-game ×1, in-play ×2, post-end ×3) × recency (6 h half-life). Blended with resting money near the top of the book (weight 0.5), then clamped into the book's bounds.
 5. Zero trades: the verdict uses resting orders only, and confidence is always Low. If the book is gone as well, Gamma's price (including a 0/1 settlement) is shown for reference and is not reported as the traders' belief.
 6. Confidence comes from the weighted signal in USD and the size of the lean (Low / Medium / High). Resolved markets show "Final" plus the pre-resolution belief.
-7. Displayed vs real: Polymarket UI price, Gamma outcomePrices, naive midpoint, last history point, last trade, VWAP, and our estimate.
+7. Displayed vs real: Polymarket UI price, Gamma outcomePrices, naive midpoint, last pre-resolution midpoint, on-chain settlement (when the series has one), last trade, VWAP, and our estimate.
 
 ## OI / volume
 
@@ -58,7 +59,10 @@ Anything else is rejected. The app does not fetch the URL you paste. Upstream re
 - `/oi` returns `[]` when no position was ever minted. `/holders` can return `null`. Gamma `volume` is `null` when there are no trades.
 - `/trades` is taker-only by default. The counterparty (for example the Under buyer on a mint) only appears with `takerOnly=false`.
 - Gamma `lastTradePrice` tracks only the outcome-0 token. A No trade at 0.999 can leave `lastTradePrice` sitting on an older Yes print.
-- `prices-history?interval=max&fidelity=1` is coarse. A `startTs`/`endTs` range returns finer points.
+- Data API v2 `/v2/prices-history` replaces CLOB `/prices-history` (shut down 30 Oct 2026). `token_id` is required. Exactly one window form per request: `start`/`end` (15 days max), `interval` (`max` is 12-hour buckets), or `as_of`. `bucket_seconds` is 60, 300, 1800, 10800, or 43200. Pages use `pagination.next_cursor`; `offset` is rejected. The old `{history:[{t,p}]}` shape is now `{data:[{timestamp,price,resolution_seconds}]}`.
+- 1-minute history is kept at least 7 days, 5-minute 60, and 30-minute 90. Asking for a grain whose window has expired returns an empty page, not a coarser series. The page requests 60-second buckets for a recent or short market, and falls back to 300, then 1800, then `interval=max`. The note shows the grain actually served (`resolution_seconds`).
+- A resolved series ends with a real tick and then one on-chain settlement point (`resolution_seconds` 0, one second later, last page only). That payout is shown as on-chain settlement and is not the last pre-resolution midpoint.
+- A 429 or 503 on price history is retried once, after at most 2 seconds of `Retry-After`, and then warned.
 - Gamma `gameStartTime` uses `2026-10-17 04:00:00+00`, not ISO.
 - Price-history moves with no trade dots are orders being placed or cancelled, not executions.
 

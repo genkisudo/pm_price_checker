@@ -60,13 +60,19 @@ class Router:
         self.fill_pages = {0: []}
         self.oi = []
         self.holders = None
-        self.history = {YES: [{"t": 1792450158, "p": 0.5}], NO: [{"t": 1792450158, "p": 0.5}]}
+        self.history = {
+            YES: [{"timestamp": 1792450158, "price": 0.5, "resolution_seconds": 300}],
+            NO: [{"timestamp": 1792450158, "price": 0.5, "resolution_seconds": 300}],
+        }
+        self.history_buckets = None
+        self.history_pages = None
+        self.history_error = None
         self.slug_market = None
         self.list_open = []
         self.list_closed = []
         self.events = []
 
-    def __call__(self, url, ttl=10):
+    def __call__(self, url, ttl=10, retry=False):
         self.urls.append(url)
         parts = urllib.parse.urlsplit(url)
         path = parts.path
@@ -97,8 +103,29 @@ class Router:
                 return None, self.book_err
             return self.books.get(tok) or {"bids": [], "asks": []}, None
         if path == "/prices-history":
-            tok = (qs.get("market") or [""])[0]
-            return {"history": self.history.get(tok, [])}, None
+            return None, "HTTP 410 CLOB prices-history is gone"
+        if path == "/v2/prices-history":
+            if "offset" in qs or "market" in qs or "fidelity" in qs or "startTs" in qs:
+                return None, "HTTP 400 rejected prices-history param"
+            if self.history_error:
+                return None, self.history_error
+            tok = (qs.get("token_id") or [""])[0]
+            cursor = (qs.get("cursor") or [""])[0]
+            if self.history_pages is not None:
+                page = self.history_pages.get(cursor)
+                if page is None:
+                    return {"data": [], "pagination": {"has_more": False, "next_cursor": None, "limit": 0, "offset": 0}}, None
+                return page, None
+            grain = (qs.get("bucket_seconds") or [None])[0]
+            interval = (qs.get("interval") or [None])[0]
+            key = interval or grain
+            if self.history_buckets is not None:
+                rows = (self.history_buckets.get(key) or {}).get(tok, [])
+            else:
+                rows = self.history.get(tok, [])
+            return {"data": rows, "pagination": {
+                "limit": 10000, "offset": 0, "has_more": False, "next_cursor": None,
+            }}, None
         if path == "/trades":
             offset = int((qs.get("offset") or ["0"])[0])
             taker = (qs.get("takerOnly") or ["true"])[0] != "false"
@@ -459,10 +486,16 @@ class AnalyzeTest(unittest.TestCase):
             self.assertTrue(all(0 <= p <= 1 for p in probs))
 
     def test_history_falls_back_to_the_other_token(self):
-        self.router.history = {YES: [], NO: [{"t": 1792450158, "p": 0.2}, {"t": "nope"}, {"p": 0.2}]}
+        self.router.history = {YES: [], NO: [
+            {"timestamp": 1792450158, "price": 0.2, "resolution_seconds": 300},
+            {"timestamp": "nope", "price": 0.2, "resolution_seconds": 300},
+            {"price": 0.2, "resolution_seconds": 300},
+        ]}
         d = self.analyze()
-        last = next(c for c in d["comparison"] if c["label"] == "Last price-history point")
+        last = next(c for c in d["comparison"] if c["label"] == "Last pre-resolution midpoint")
         self.assertEqual(last["p"][0], 0.8)
+        self.assertNotIn("clob.polymarket.com/prices-history", " ".join(self.router.urls))
+        self.assertTrue(any("/v2/prices-history" in u and "token_id=" in u for u in self.router.urls))
 
     def test_trade_phases_follow_game_clock(self):
         start = "2026-10-18 15:00:00+00"
@@ -531,10 +564,10 @@ class AnalyzeTest(unittest.TestCase):
         # Simpler: wrap fetch to error the taker URL.
         orig = self.router
 
-        def fetch(url, ttl=10):
+        def fetch(url, ttl=10, retry=False):
             if "/trades?" in url and "takerOnly=false" not in url:
                 return None, "HTTP 500 down"
-            return orig(url, ttl)
+            return orig(url, ttl, retry=retry)
         self.router.taker_pages = {0: []}
         pm.fetch_json = fetch
         a = "0x" + "12" * 20
@@ -614,6 +647,166 @@ class AnalyzeTest(unittest.TestCase):
         self.assertNotIn("not-a-token", book_urls[0])
 
 
+def _page(rows, cursor=None, more=False):
+    return {
+        "data": rows,
+        "pagination": {"limit": len(rows), "offset": 0, "has_more": more, "next_cursor": cursor},
+    }
+
+
+def _pt(ts, price, res):
+    return {"timestamp": ts, "price": price, "resolution_seconds": res}
+
+
+class HistoryTest(unittest.TestCase):
+    def setUp(self):
+        self.router = Router()
+        self._orig = pm.fetch_json
+        pm.fetch_json = self.router
+        pm._cache.clear()
+
+    def tearDown(self):
+        pm.fetch_json = self._orig
+        pm._cache.clear()
+
+    def _urls(self):
+        return [u for u in self.router.urls if "/v2/prices-history" in u]
+
+    def test_pagination_keeps_settlement_off_the_midpoint_series(self):
+        now = 1_800_000_000.0
+        start = now - 2 * 86400
+        self.router.history_pages = {
+            "": _page([
+                _pt(int(start) + 60, 0.40, 60),
+                _pt(int(start) + 120, 0.41, 0),
+            ], cursor="page-2", more=True),
+            "page-2": _page([
+                _pt(int(start) + 180, 0.42, 60),
+                _pt(int(start) + 200, 0.55, 0),
+                _pt(int(start) + 201, 1.0, 0),
+            ]),
+        }
+        pts, err, info = pm.get_history(YES, start, now, now)
+        self.assertIsNone(err)
+        self.assertEqual([p["p"] for p in pts], [0.40, 0.41, 0.42, 0.55])
+        self.assertEqual(info["settlement"]["p"], 1.0)
+        self.assertEqual(info["settlement"]["resolution_seconds"], 0)
+        self.assertEqual(info["grain"], 60)
+        self.assertFalse(info["fallback"])
+        urls = self._urls()
+        self.assertEqual(len(urls), 2)
+        self.assertIn("cursor=page-2", urls[1])
+        self.assertNotIn("cursor=", urls[0])
+        for u in urls:
+            self.assertIn("token_id=" + YES, u)
+            self.assertIn("bucket_seconds=60", u)
+            self.assertNotIn("offset=", u)
+            self.assertNotIn("market=", u)
+            self.assertNotIn("clob.polymarket.com", u)
+            self.assertTrue(u.startswith("https://data-api.polymarket.com/v2/prices-history?"))
+
+    def test_empty_page_falls_back_to_coarser_grain(self):
+        now = 1_800_000_000.0
+        start = now - 3 * 86400
+        self.router.history_buckets = {
+            "60": {YES: [], NO: []},
+            "300": {YES: [_pt(int(start) + 300, 0.33, 300), _pt(int(start) + 600, 0.34, 300)], NO: []},
+        }
+        pts, err, info = pm.get_history(YES, start, now, now)
+        self.assertIsNone(err)
+        self.assertEqual(len(pts), 2)
+        self.assertEqual(info["grain"], 300)
+        self.assertTrue(info["fallback"])
+        self.assertIn("came back empty", info["note"])
+        self.assertIn("resolution_seconds=300", info["note"])
+        urls = self._urls()
+        self.assertTrue(any("bucket_seconds=60" in u for u in urls))
+        self.assertTrue(any("bucket_seconds=300" in u for u in urls))
+        self.assertFalse(any("bucket_seconds=1800" in u or "interval=max" in u for u in urls))
+
+    def test_older_window_skips_one_minute_and_chunks_fifteen_days(self):
+        now = 1_800_000_000.0
+        start = now - 20 * 86400
+        self.router.history_buckets = {
+            "300": {YES: [_pt(int(start) + 300, 0.2, 300)]},
+        }
+        pts, err, info = pm.get_history(YES, start, now, now)
+        self.assertIsNone(err)
+        self.assertEqual(len(pts), 1)
+        self.assertEqual(info["grain"], 300)
+        self.assertIn("older than", info["note"])
+        self.assertIn("1-minute", info["note"])
+        urls = self._urls()
+        self.assertTrue(urls)
+        self.assertFalse(any("bucket_seconds=60" in u for u in urls))
+        self.assertTrue(all("bucket_seconds=300" in u for u in urls))
+        spans = []
+        for u in urls:
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(u).query)
+            span = int(qs["end"][0]) - int(qs["start"][0])
+            spans.append(span)
+            self.assertLessEqual(span, 15 * 86400)
+            self.assertNotIn("offset", qs)
+        self.assertGreaterEqual(len(spans), 2)
+        self.assertLessEqual(max(spans), 15 * 86400)
+
+    def test_fractional_settlement_is_split_and_a_lone_tick_is_kept(self):
+        real, settle = pm.split_history_settlement([
+            {"t": 1, "p": 0.4, "resolution_seconds": 60},
+            {"t": 10, "p": 0.5, "resolution_seconds": 0},
+            {"t": 11, "p": 0.5, "resolution_seconds": 0},
+        ])
+        self.assertEqual(settle["p"], 0.5)
+        self.assertEqual(real[-1], {"t": 10, "p": 0.5, "resolution_seconds": 0})
+        real, settle = pm.split_history_settlement([
+            {"t": 1, "p": 0.4, "resolution_seconds": 60},
+            {"t": 10, "p": 0.44, "resolution_seconds": 0},
+        ])
+        self.assertIsNone(settle)
+        self.assertEqual(len(real), 2)
+
+    def test_rate_limit_does_not_walk_coarser_grains(self):
+        now = 1_800_000_000.0
+        self.router.history_error = "HTTP 429 busy; retried once"
+        pts, err, info = pm.get_history(YES, now - 86400, now, now)
+        self.assertEqual(pts, [])
+        self.assertIn("429", err)
+        self.assertIn("retried once", err)
+        urls = self._urls()
+        self.assertEqual(len(urls), 1)
+        self.assertIn("bucket_seconds=60", urls[0])
+        self.assertNotIn("interval=max", urls[0])
+
+    def test_analyze_surfaces_settlement_separately_from_the_midpoint(self):
+        now = pm.time.time()
+        created = pm.datetime.fromtimestamp(now - 2 * 86400, pm.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.router.gamma = gamma(
+            createdAt=created, closed=True, umaResolutionStatus="resolved",
+            outcomePrices=json.dumps(["1", "0"]),
+        )
+        t0 = int(now - 3600)
+        self.router.history = {
+            YES: [_pt(t0, 0.42, 60), _pt(t0 + 120, 0.61, 0), _pt(t0 + 121, 1.0, 0)],
+            NO: [_pt(t0, 0.58, 60), _pt(t0 + 120, 0.39, 0), _pt(t0 + 121, 0.0, 0)],
+        }
+        d = pm.analyze("100")
+        last = next(c for c in d["comparison"] if c["label"] == "Last pre-resolution midpoint")
+        settle = next(c for c in d["comparison"] if c["label"] == "On-chain settlement")
+        self.assertEqual(last["p"][0], 0.61)
+        self.assertEqual(settle["p"], [1.0, 0.0])
+        self.assertIn("Not a trader midpoint", settle["note"])
+        self.assertIn("resolution_seconds=60", last["note"])
+        self.assertEqual(d["history"][0][-1]["p"], 0.61)
+        self.assertTrue(all(p["p"] != 1.0 for p in d["history"][0]))
+        self.assertEqual(d["historyMeta"][0]["settlement"], 1.0)
+        self.assertEqual(d["historyMeta"][0]["grainSeconds"], 60)
+        self.assertIn("Data API v2", d["historyNote"])
+        self.assertNotIn("CLOB", d["historyNote"])
+        self.assertNotIn("clob.polymarket.com/prices-history", " ".join(self.router.urls))
+        for u in self._urls():
+            self.assertNotIn("offset=", u)
+
+
 class HelperTest(unittest.TestCase):
     def test_parse_ts_gamma_formats(self):
         a = pm.parse_ts("2026-10-17 04:00:00+00")
@@ -640,6 +833,8 @@ class HelperTest(unittest.TestCase):
         self.assertTrue(pm._allowed_url("https://gamma-api.polymarket.com/markets/1"))
         self.assertTrue(pm._allowed_url("https://clob.polymarket.com/book?token_id=1"))
         self.assertTrue(pm._allowed_url("https://data-api.polymarket.com/trades?market=0xab"))
+        self.assertTrue(pm._allowed_url(
+            "https://data-api.polymarket.com/v2/prices-history?token_id=1&bucket_seconds=60&start=1&end=2"))
         for bad in (
             "http://gamma-api.polymarket.com/markets/1",
             "https://user:pass@gamma-api.polymarket.com/markets/1",
@@ -663,6 +858,58 @@ class HelperTest(unittest.TestCase):
             req, None, 302, "Found", headers, "https://clob.polymarket.com/book?token_id=1")
         self.assertIsNotNone(ok)
         self.assertIn("clob.polymarket.com", ok.full_url)
+
+    def test_price_history_retries_429_and_503_once(self):
+        for status in (429, 503):
+            calls = []
+            sleeps = []
+
+            def fake(url, code=status):
+                calls.append(url)
+                if len(calls) == 1:
+                    return None, f"HTTP {code} busy", code, 50
+                return {"data": [{"timestamp": 1, "price": 0.5, "resolution_seconds": 60}],
+                        "pagination": {"has_more": False, "next_cursor": None}}, None, 200, None
+
+            orig_http, orig_sleep = pm._http_json, pm.time.sleep
+            pm._http_json = fake
+            pm.time.sleep = lambda s: sleeps.append(s)
+            pm._cache.clear()
+            try:
+                data, err = pm.fetch_json(
+                    "https://data-api.polymarket.com/v2/prices-history?token_id=1&bucket_seconds=60",
+                    retry=True)
+            finally:
+                pm._http_json = orig_http
+                pm.time.sleep = orig_sleep
+                pm._cache.clear()
+            self.assertIsNone(err, status)
+            self.assertEqual(len(calls), 2, status)
+            self.assertEqual(sleeps, [pm.HISTORY_RETRY_CAP], status)
+            self.assertEqual(data["data"][0]["price"], 0.5)
+
+        calls = []
+
+        def always(url):
+            calls.append(url)
+            return None, "HTTP 429 busy", 429, 0
+
+        orig_http, orig_sleep = pm._http_json, pm.time.sleep
+        pm._http_json = always
+        pm.time.sleep = lambda s: (_ for _ in ()).throw(AssertionError("should not sleep on Retry-After 0"))
+        pm._cache.clear()
+        try:
+            data, err = pm.fetch_json(
+                "https://data-api.polymarket.com/v2/prices-history?token_id=1&interval=max",
+                retry=True)
+        finally:
+            pm._http_json = orig_http
+            pm.time.sleep = orig_sleep
+            pm._cache.clear()
+        self.assertIsNone(data)
+        self.assertIn("retried once", err)
+        self.assertIn("429", err)
+        self.assertEqual(len(calls), 2)
 
     def test_fetch_json_does_not_touch_link_local(self):
         hits = {"n": 0}

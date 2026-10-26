@@ -11,7 +11,8 @@ JSON analysis: GET /api/market/<id>
 
 The server binds to loopback only. It never fetches a URL the user pasted.
 Upstream calls go only to the public Polymarket Gamma, CLOB, and data APIs,
-and redirects off those hosts are refused.
+and redirects off those hosts are refused. Price history comes from Data API v2
+/v2/prices-history, not the retired CLOB /prices-history route.
 """
 import ipaddress
 import json
@@ -54,6 +55,14 @@ INPLAY_DEFAULT_H = 2.0     # if endDate == gameStart (sports), assume play lasts
 TRADE_PAGE = 500
 MAX_TRADE_OFFSET = 3000
 MAX_QUERY_LEN = 500
+# Data API v2 prices-history. Explicit start/end windows cap at 15 days.
+# 1-minute data is kept at least 7 days, 5-minute 60, 30-minute 90.
+HISTORY_WINDOW_S = 15 * 86400
+HISTORY_RETENTION_S = {60: 7 * 86400, 300: 60 * 86400, 1800: 90 * 86400}
+HISTORY_GRAINS = (60, 300, 1800)
+HISTORY_PAGE_CAP = 8
+HISTORY_RETRY_CAP = 2.0  # seconds; one retry, never block on a long Retry-After
+_GRAIN_NAMES = {60: "1-minute", 300: "5-minute", 1800: "30-minute", 10800: "3-hour", 43200: "12-hour"}
 
 # ----- HTTP helpers -----------------------------------------------------------
 _cache = {}
@@ -106,8 +115,58 @@ def _cache_put(url, data, err, ttl):
         _cache.pop(next(iter(_cache)))
 
 
-def fetch_json(url, ttl=10):
-    """GET JSON. Returns (data, error_string). Never raises. Never leaves the allowlist."""
+def _retry_after_seconds(headers):
+    """Retry-After as a non-negative number of seconds, or None."""
+    if headers is None:
+        return None
+    try:
+        raw = headers.get("Retry-After")
+    except Exception:
+        return None
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        sec = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(sec) or sec < 0:
+        return None
+    return sec
+
+
+def _http_json(url):
+    """One GET. Returns (data, error, status, retry_after_seconds). Does not cache."""
+    try:
+        req = urllib.request.Request(url, headers=UA)
+        with _OPENER.open(req, timeout=20) as r:
+            raw = r.read().decode("utf-8", "replace")
+        data = json.loads(raw) if raw.strip() else None
+        return data, None, getattr(r, "status", 200) or 200, None
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            body = ""
+        msg = " ".join(f"{e.code} {e.reason or ''} {body}".split())
+        return None, f"HTTP {msg}".strip(), e.code, _retry_after_seconds(getattr(e, "headers", None))
+    except Exception as e:  # network, JSON
+        return None, f"{type(e).__name__}: {e}", None, None
+
+
+def _rate_limited(err, status=None):
+    if status in (429, 503):
+        return True
+    text = str(err or "")
+    return text.startswith("HTTP 429") or text.startswith("HTTP 503") or " HTTP 429" in text or " HTTP 503" in text
+
+
+def fetch_json(url, ttl=10, retry=False):
+    """GET JSON. Returns (data, error_string). Never raises. Never leaves the allowlist.
+
+    retry=True does one extra attempt after 429 or 503, sleeping at most
+    HISTORY_RETRY_CAP seconds of the Retry-After value. The failure is then
+    the caller's to warn about.
+    """
     if not _allowed_url(url):
         return None, "blocked non-allowlisted URL"
     now = time.time()
@@ -115,25 +174,17 @@ def fetch_json(url, ttl=10):
         hit = _cache_get(url, now)
         if hit is not None:
             return hit
-    data, err = None, None
+    data, err, status, retry_after = _http_json(url)
+    if retry and _rate_limited(err, status):
+        delay = 0.0 if retry_after is None else min(retry_after, HISTORY_RETRY_CAP)
+        if delay:
+            time.sleep(delay)
+        data, err, status, retry_after = _http_json(url)
+        if _rate_limited(err, status):
+            err = (err or f"HTTP {status}") + "; retried once"
     store_ttl = ttl
-    try:
-        req = urllib.request.Request(url, headers=UA)
-        with _OPENER.open(req, timeout=20) as r:
-            raw = r.read().decode("utf-8", "replace")
-        data = json.loads(raw) if raw.strip() else None
-    except urllib.error.HTTPError as e:
-        try:
-            body = e.read().decode("utf-8", "replace")[:200]
-        except Exception:
-            body = ""
-        msg = " ".join(f"{e.code} {e.reason or ''} {body}".split())
-        err = f"HTTP {msg}".strip()
-        # 404s are stable (closed books). Timeouts and 5xx should be retried quickly.
-        if e.code not in (400, 404, 410, 422):
-            store_ttl = min(ttl, 2)
-    except Exception as e:  # network, JSON
-        err = f"{type(e).__name__}: {e}"
+    # 404s are stable (closed books). Timeouts and 5xx should be retried quickly.
+    if err and status not in (400, 404, 410, 422):
         store_ttl = min(ttl, 2)
     with _cache_lock:
         _cache_put(url, data, err, store_ttl)
@@ -434,30 +485,284 @@ def get_trades(cond, taker_only=True):
     return out, errs, truncated
 
 
-def get_history(token, start_ts, end_ts):
-    """Try a fine-grained range query first, fall back to interval=max."""
-    if not re.fullmatch(r"\d{1,80}", str(token)):
-        return [], "invalid token id"
-    tok = urllib.parse.quote(str(token), safe="")
+def grain_label(seconds):
+    if seconds is None:
+        return "unknown"
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return "unknown"
+    if seconds in _GRAIN_NAMES:
+        return _GRAIN_NAMES[seconds]
+    if seconds == 0:
+        return "exact tick"
+    return f"{seconds}-second"
 
-    def history_of(data):
+
+def _history_url(params):
+    """Build a Data API v2 prices-history URL. Never sends offset or the old market param."""
+    clean = []
+    for key, value in params.items():
+        if key in ("offset", "market", "fidelity", "startTs", "endTs") or value is None:
+            continue
+        clean.append((key, value))
+    return f"{DATA}/v2/prices-history?{urllib.parse.urlencode(clean)}"
+
+
+def _history_chunks(start, end):
+    """Split [start, end) into windows of at most 15 days. end is exclusive."""
+    start = int(start)
+    end = int(end)
+    if end <= start:
+        return
+    span = HISTORY_WINDOW_S
+    cur = start
+    while cur < end:
+        nxt = min(cur + span, end)
+        yield cur, nxt
+        cur = nxt
+
+
+def _normalize_history_row(row):
+    if not isinstance(row, dict):
+        return None
+    ts = epoch_seconds(row.get("timestamp"))
+    price = fnum(row.get("price"))
+    res = row.get("resolution_seconds")
+    if isinstance(res, bool) or res is None:
+        return None
+    try:
+        res = int(res)
+    except (TypeError, ValueError):
+        return None
+    if ts is None or price is None or not (0.0 <= price <= 1.0) or res < 0:
+        return None
+    return {"t": int(ts), "p": price, "resolution_seconds": res}
+
+
+def _dedupe_history(rows):
+    by = {}
+    for row in rows or []:
+        pt = row if isinstance(row, dict) and "resolution_seconds" in row and "t" in row else _normalize_history_row(row)
+        if not pt:
+            continue
+        by[pt["t"]] = pt
+    return [by[t] for t in sorted(by)]
+
+
+def split_history_settlement(points):
+    """Drop the on-chain settlement point from a v2 series.
+
+    A resolved market appends one extra point, resolution_seconds 0, one second
+    after the terminal real tick (also resolution_seconds 0). That payout is not
+    a trader midpoint. An unresolved series ends on a single real tick and is
+    left unchanged. Settlement is only identified once the pages are concatenated,
+    because the API attaches it on the last page only.
+    """
+    if len(points) >= 2:
+        prev, last = points[-2], points[-1]
+        if (prev.get("resolution_seconds") == 0 and last.get("resolution_seconds") == 0
+                and last.get("t") == prev.get("t") + 1):
+            return points[:-1], dict(last)
+    return points, None
+
+
+def _observed_grain(points):
+    counts = {}
+    for pt in points:
+        res = pt.get("resolution_seconds") or 0
+        if res:
+            counts[res] = counts.get(res, 0) + 1
+    if not counts:
+        return 0 if points else None
+    return max(counts, key=lambda k: (counts[k], -k))
+
+
+def _fetch_history_pages(params):
+    """Follow next_cursor. Returns (raw_rows, error). Never sends offset."""
+    rows = []
+    cursor = None
+    err_out = None
+    for _ in range(HISTORY_PAGE_CAP):
+        q = dict(params)
+        if cursor:
+            q["cursor"] = cursor
+        data, err = fetch_json(_history_url(q), ttl=30, retry=True)
+        if err and not isinstance(data, dict):
+            return rows, err
         if not isinstance(data, dict):
-            return None
-        h = data.get("history")
-        return h if isinstance(h, list) else None
+            return rows, err or "unexpected prices-history payload"
+        page = data.get("data")
+        if page is None:
+            page = []
+        if not isinstance(page, list):
+            return rows, "unexpected prices-history payload"
+        rows.extend(page)
+        pag = data.get("pagination") if isinstance(data.get("pagination"), dict) else {}
+        if not pag.get("has_more"):
+            return rows, err
+        cursor = pag.get("next_cursor")
+        if not isinstance(cursor, str) or not cursor:
+            return rows, err or "prices-history has_more without next_cursor"
+        err_out = err
+    return rows, err_out or "price-history page cap"
 
-    if start_ts and end_ts and end_ts > start_ts:
-        span_min = (end_ts - start_ts) / 60
-        fid = max(1, int(math.ceil(span_min / 3000)))
-        data, err = fetch_json(
-            f"{CLOB}/prices-history?market={tok}&startTs={int(start_ts)}&endTs={int(end_ts)}&fidelity={fid}",
-            ttl=30)
-        h = history_of(data)
-        if h:
-            return h, None
-    data, err = fetch_json(f"{CLOB}/prices-history?market={tok}&interval=max&fidelity=1", ttl=30)
-    h = history_of(data)
-    return (h or []), err
+
+def _fetch_history_window(token, start, end, extra):
+    rows = []
+    err_out = None
+    params = {"token_id": str(token)}
+    params.update(extra)
+    # interval=max is the whole life; start/end would be a second window form.
+    if extra.get("interval"):
+        page, err = _fetch_history_pages(params)
+        return page, err
+    for c_start, c_end in _history_chunks(start, end):
+        page, err = _fetch_history_pages({**params, "start": c_start, "end": c_end})
+        if page:
+            rows.extend(page)
+        if err and _rate_limited(err):
+            return rows, err
+        if err:
+            err_out = err
+    return rows, err_out
+
+
+def _settlement_pair(infos):
+    """Outcome-0/outcome-1 settlement prices, or None when neither token has one."""
+    vals = []
+    for info in infos or []:
+        s = info.get("settlement") if isinstance(info, dict) else None
+        price = fnum(s.get("p")) if isinstance(s, dict) else None
+        if price is None or not (0.0 <= price <= 1.0):
+            vals.append(None)
+        else:
+            vals.append(price)
+    while len(vals) < 2:
+        vals.append(None)
+    if vals[0] is None and vals[1] is None:
+        return None
+    if vals[0] is None:
+        vals[0] = 1 - vals[1]
+    elif vals[1] is None:
+        vals[1] = 1 - vals[0]
+    return [round(vals[0], 4), round(vals[1], 4)]
+
+
+def _history_comparison_note(outcomes, infos):
+    parts = []
+    grains = []
+    for outcome, info in zip(outcomes, infos or []):
+        grain = info.get("grain") if isinstance(info, dict) else None
+        if grain:
+            phrase = f"{grain_label(grain)} buckets (resolution_seconds={grain})"
+        elif isinstance(info, dict) and info.get("grain") == 0:
+            phrase = "exact ticks (resolution_seconds=0)"
+        else:
+            phrase = "no points"
+        parts.append(f"{outcome}: {phrase}")
+        grains.append(grain)
+    if len(parts) == 2 and grains[0] == grains[1] and grains[0]:
+        return f"Data API v2 prices-history, {grain_label(grains[0])} buckets (resolution_seconds={grains[0]})"
+    return "Data API v2 prices-history — " + "; ".join(parts)
+
+
+def _history_chart_note(outcomes, infos):
+    note = _history_comparison_note(outcomes, infos)
+    return (
+        f"Lines are {note}, not trades. The on-chain settlement point is left off this chart. "
+        "A move with no dot is orders being placed or cancelled. "
+        f"Dots = executed trades, sized by USD; filled = BUY, hollow = SELL; blue = {outcomes[0]}, orange = {outcomes[1]}. "
+        "Dashed lines: game start, end date, first trade."
+    )
+
+
+def _history_result(raw_rows, err, skipped, emptied, via_max):
+    points = _dedupe_history(raw_rows)
+    real, settlement = split_history_settlement(points)
+    grain = _observed_grain(real)
+    fallback = bool(skipped or emptied or via_max)
+    if grain:
+        shown = f"{grain_label(grain)} buckets (resolution_seconds={grain})"
+    elif real:
+        shown = "exact ticks (resolution_seconds=0)"
+    elif via_max:
+        shown = "12-hour buckets (resolution_seconds=43200)"
+    else:
+        shown = "no points"
+    if not fallback and grain is not None:
+        note = f"Price history used {shown} from Data API v2."
+    else:
+        reasons = []
+        if skipped:
+            names = ", ".join(grain_label(g) for g in skipped)
+            reasons.append(f"window is older than {names} retention")
+        if emptied:
+            names = ", ".join(grain_label(g) for g in emptied)
+            reasons.append(f"{names} price history came back empty")
+        if via_max and not reasons:
+            reasons.append("finer price history was unavailable")
+        note = f"{'; '.join(reasons)}; showing {shown} from Data API v2." if reasons else None
+    info = {
+        "grain": grain,
+        "grainLabel": grain_label(grain) if grain else None,
+        "settlement": settlement,
+        "fallback": fallback,
+        "note": note,
+        "source": "Data API v2 prices-history",
+    }
+    return real, err, info
+
+
+def get_history(token, start_ts, end_ts, now=None):
+    """Price history from Data API v2.
+
+    Recent or short windows ask for bucket_seconds=60 over chunks of at most
+    15 days, following cursors. A window older than that grain's retention is
+    not requested at that grain. An empty page (the API does not substitute a
+    coarser grain) falls through 300, then 1800, then interval=max.
+    Returns (midpoint_points, error, info). Settlement is in info, not points.
+    """
+    empty = {"grain": None, "grainLabel": None, "settlement": None, "fallback": False,
+             "note": None, "source": "Data API v2 prices-history"}
+    if not re.fullmatch(r"\d{1,80}", str(token)):
+        return [], "invalid token id", empty
+    clock = time.time() if now is None else float(now)
+    if start_ts is None:
+        start_ts = clock - 30 * 86400
+    if end_ts is None:
+        end_ts = clock
+    try:
+        start = int(math.floor(float(start_ts)))
+        # end is exclusive; step one second past the requested instant.
+        end = int(math.ceil(float(end_ts))) + 1
+    except (TypeError, ValueError):
+        return [], "invalid history window", empty
+    if end <= start:
+        return [], None, empty
+
+    skipped, emptied = [], []
+    for grain in HISTORY_GRAINS:
+        retain = HISTORY_RETENTION_S[grain]
+        if clock - start > retain:
+            skipped.append(grain)
+            continue
+        raw, err = _fetch_history_window(token, start, end, {"bucket_seconds": grain})
+        if err and _rate_limited(err):
+            real, err_out, info = _history_result(raw, err, skipped, emptied, False)
+            return real, err_out, info
+        if raw:
+            return _history_result(raw, err, skipped, emptied, False)
+        if err:
+            emptied.append(grain)
+            continue
+        emptied.append(grain)
+
+    raw, err = _fetch_history_window(token, start, end, {"interval": "max"})
+    if err and _rate_limited(err) and not raw:
+        real, err_out, info = _history_result(raw, err, skipped, emptied, True)
+        return real, err_out, info
+    return _history_result(raw, err, skipped, emptied, True)
 
 
 # ----- analysis ---------------------------------------------------------------
@@ -606,19 +911,6 @@ def public_fill(t, role):
     return out
 
 
-def history_points(raw):
-    pts = []
-    for x in raw or []:
-        if not isinstance(x, dict):
-            continue
-        ts = epoch_seconds(x.get("t"))
-        p = fnum(x.get("p"))
-        if ts is None or p is None or not (0.0 <= p <= 1.0):
-            continue
-        pts.append({"t": int(ts), "p": p})
-    return pts
-
-
 def analyze(market_id):
     mid, err, status_code = resolve_market_id(market_id)
     if not mid:
@@ -668,8 +960,8 @@ def analyze(market_id):
         enc_cond = urllib.parse.quote(cond, safe="")
         f_oi = ex.submit(fetch_json, f"{DATA}/oi?market={enc_cond}", 15)
         f_hold = ex.submit(fetch_json, f"{DATA}/holders?market={enc_cond}&limit=20", 30)
-        hist_start = (created or now - 30 * 86400) - 3600
-        f_hist = [ex.submit(get_history, t, hist_start, now) for t in tokens]
+        hist_start = created or (now - 30 * 86400)
+        f_hist = [ex.submit(get_history, t, hist_start, now, now) for t in tokens]
         books_raw = [f.result() for f in f_books]
         trades_raw, trade_errs, trade_trunc = f_trades.result()
         fills_raw, fill_errs, fill_trunc = f_fills.result()
@@ -1082,11 +1374,18 @@ def analyze(market_id):
 
     # ---- history ----
     history = []
-    for i, (h, e) in enumerate(hists):
-        pts = history_points(h)
-        history.append(pts)
-        if not pts:
-            warnings.append(f"prices-history empty for {outcomes[i]}" + (f" ({short_err(e)})" if e else ""))
+    history_meta = []
+    for i, (pts, err, info) in enumerate(hists):
+        if not isinstance(info, dict):
+            info = {}
+        history.append(pts or [])
+        history_meta.append(info)
+        if err:
+            warnings.append(f"prices-history for {outcomes[i]}: {short_err(err)}")
+        elif not pts:
+            warnings.append(f"prices-history empty for {outcomes[i]}")
+        if info.get("fallback") and info.get("note"):
+            warnings.append(info["note"])
     last_hist = history[0][-1]["p"] if history and history[0] else None
     if last_hist is None and len(history) > 1 and history[1]:
         last_hist = 1 - history[1][-1]["p"]
@@ -1109,7 +1408,11 @@ def analyze(market_id):
          "p": [gprices[0], gprices[1]] if len(gprices) == 2 and None not in gprices else None},
         {"label": "Naive midpoint", "note": "(bid+ask)/2, empty side = 0 / 1" + ("" if mid_valid else " — NOT valid"),
          "p": pair(naive_mid)},
-        {"label": "Last price-history point", "note": "CLOB prices-history (midpoint series)", "p": pair(last_hist)},
+        {"label": "Last pre-resolution midpoint", "note": _history_comparison_note(outcomes, history_meta),
+         "p": pair(last_hist)},
+        *([{"label": "On-chain settlement",
+            "note": "Data API v2 prices-history settlement point (resolution_seconds=0). Not a trader midpoint.",
+            "p": settle_pair}] if (settle_pair := _settlement_pair(history_meta)) else []),
         {"label": "Last trade",
          "note": (f"{last_trade['outcome']} {last_trade['side']} @ {last_trade['price']} · {last_trade['time']}"
                   if last_trade else "no trades"),
@@ -1167,6 +1470,19 @@ def analyze(market_id):
         "trades": trades_out,
         "fills": all_fills,
         "history": history,
+        "historyMeta": [
+            {
+                "outcome": outcomes[i] if i < len(outcomes) else str(i),
+                "grainSeconds": info.get("grain"),
+                "grainLabel": info.get("grainLabel"),
+                "points": len(history[i]) if i < len(history) else 0,
+                "settlement": None if not isinstance(info.get("settlement"), dict) else info["settlement"].get("p"),
+                "fallback": bool(info.get("fallback")),
+                "note": info.get("note"),
+            }
+            for i, info in enumerate(history_meta)
+        ],
+        "historyNote": _history_chart_note(outcomes, history_meta),
         "holders": holders,
         "warnings": deduped,
         "generatedAt": madrid(now),
@@ -1318,7 +1634,7 @@ function render(d){
 
   <div class="card" style="margin-bottom:16px"><h2>Price history (${esc(A)} / ${esc(B)})</h2>
     <div style="height:360px"><canvas id="ch"></canvas></div>
-    <div class="chartnote">Lines are CLOB <b>midpoints</b> (empty side counted as 0 / 1), not trades. Any move without a dot is just orders being placed or cancelled. Dots = executed trades, sized by USD; filled = BUY, hollow = SELL; blue = ${esc(A)}, orange = ${esc(B)}. Dashed lines: game start, end date, first trade.</div></div>
+    <div class="chartnote">${esc(d.historyNote||'')}</div></div>
 
   <div class="grid g2" style="margin-bottom:16px">
     <div class="card"><h2>Unified order book (in ${esc(A)} price)</h2>${bookHtml(d)}</div>
