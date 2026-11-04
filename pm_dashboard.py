@@ -11,8 +11,8 @@ JSON analysis: GET /api/market/<id>
 
 The server binds to loopback only. It never fetches a URL the user pasted.
 Upstream calls go only to the public Polymarket Gamma, CLOB, and data APIs,
-and redirects off those hosts are refused. Price history comes from Data API v2
-/v2/prices-history, not the retired CLOB /prices-history route.
+and redirects off those hosts are refused. Every Data API call is v2
+(/v2/trades, /v2/oi, /v2/holders, /v2/prices-history). Data API v1 is retired.
 """
 import ipaddress
 import json
@@ -53,7 +53,8 @@ PHASE_MULT = {"pre-game": 1.0, "in-play": 2.0, "post-end": 3.0, "n/a": 1.0}
 BOOK_WEIGHT = 0.5          # resting money counts half as much as executed money
 INPLAY_DEFAULT_H = 2.0     # if endDate == gameStart (sports), assume play lasts ~2h
 TRADE_PAGE = 500
-MAX_TRADE_OFFSET = 3000
+MAX_TRADE_PAGES = 8          # cursor pages; v2 rejects offset. 8*500 covers the old 3k-row cap
+HOLDERS_PAGE_CAP = 5
 MAX_QUERY_LEN = 500
 # Data API v2 prices-history. Explicit start/end windows cap at 15 days.
 # 1-minute data is kept at least 7 days, 5-minute 60, 30-minute 90.
@@ -445,44 +446,172 @@ def resolve_market_id(q):
     return None, f"Could not resolve '{slug}' to a market id", 404
 
 
+def _v2_url(path, params):
+    """Data API v2 URL. Drops v1-only params (offset, market) so they cannot be sent."""
+    clean = []
+    for key, value in params.items():
+        if key in ("offset", "market", "market_id", "marketId") or value is None:
+            continue
+        clean.append((key, value))
+    return f"{DATA}{path}?{urllib.parse.urlencode(clean)}"
+
+
+def _v2_pages(path, params, page_cap):
+    """Follow next_cursor. Returns (rows or None, error, truncated).
+
+    None means a documented miss (`data: null`) on the first page. truncated is
+    set when has_more is still true at the page cap.
+    """
+    rows = []
+    cursor = None
+    err_out = None
+    cap = page_cap if isinstance(page_cap, int) and page_cap > 0 else 0
+    for _ in range(cap):
+        q = dict(params)
+        if cursor:
+            q["cursor"] = cursor
+        data, err = fetch_json(_v2_url(path, q), ttl=15, retry=True)
+        if not isinstance(data, dict):
+            return (rows or None), (err or "unexpected data-api payload"), False
+        page = data.get("data")
+        if page is None:
+            if not rows:
+                return None, err, False
+            page = []
+        if not isinstance(page, list):
+            return rows, "unexpected data-api payload", False
+        rows.extend(page)
+        pag = data.get("pagination") if isinstance(data.get("pagination"), dict) else {}
+        if not pag.get("has_more"):
+            return rows, err, False
+        nxt = pag.get("next_cursor")
+        if not isinstance(nxt, str) or not nxt:
+            return rows, err or "data-api has_more without next_cursor", False
+        cursor = nxt
+        err_out = err
+    return rows, err_out, True
+
+
+def adapt_trade(row):
+    """v2 trade row -> the camelCase fill the belief model already consumes.
+
+    There is no `asset` field on v2; token_id is the outcome token. Volume
+    fields prefixed taker_ are one side of a match and are not read here.
+    """
+    if not isinstance(row, dict):
+        return None
+    token = row.get("token_id")
+    wallet = row.get("proxy_wallet") or ""
+    if not isinstance(wallet, str):
+        wallet = ""
+    name = row.get("name") or ""
+    pseudo = row.get("pseudonym") or ""
+    tx = row.get("transaction_hash") or ""
+    return {
+        "transactionHash": tx if isinstance(tx, str) else "",
+        "asset": "" if token is None else str(token),
+        "size": row.get("size"),
+        "price": row.get("price"),
+        "side": row.get("side"),
+        "proxyWallet": wallet,
+        "outcomeIndex": row.get("outcome_index"),
+        "outcome": row.get("outcome") if isinstance(row.get("outcome"), str) else "",
+        "timestamp": row.get("timestamp"),
+        "name": name if isinstance(name, str) else "",
+        "pseudonym": pseudo if isinstance(pseudo, str) else "",
+    }
+
+
 def get_trades(cond, taker_only=True):
-    """Paginate /trades. Returns (rows, errors, truncated)."""
-    out, errs, seen = [], [], set()
-    offset = 0
-    truncated = False
-    limit = TRADE_PAGE
-    flag = "true" if taker_only else "false"
-    while offset <= MAX_TRADE_OFFSET:
-        qs = urllib.parse.urlencode({
-            "market": cond, "limit": str(limit), "offset": str(offset), "takerOnly": flag,
-        })
-        data, err = fetch_json(f"{DATA}/trades?{qs}")
-        if err:
-            errs.append(err)
-            break
-        if not isinstance(data, list) or not data:
-            break
-        added = 0
-        for t in data:
-            if not isinstance(t, dict):
-                continue
-            k = (t.get("transactionHash"), str(t.get("asset")), str(t.get("size")),
-                 str(t.get("price")), str(t.get("side") or "").upper(),
-                 str(t.get("proxyWallet") or "").lower())
-            if k in seen:
-                continue
-            seen.add(k)
-            out.append(t)
-            added += 1
-        if len(data) < limit:
-            break
-        if added == 0:
-            break  # offset ignored or repeating page
-        if offset + limit > MAX_TRADE_OFFSET:
-            truncated = True
-            break
-        offset += limit
+    """Cursor-paginate /v2/trades. Returns (rows, errors, truncated).
+
+    taker_only defaults to true on the server and undercounts a market: a mint
+    or a match then shows only one side. Pass false to include maker fills.
+    """
+    if not re.fullmatch(r"0x[a-fA-F0-9]{64}", str(cond or "")):
+        return [], ["invalid condition id"], False
+    limit = TRADE_PAGE if isinstance(TRADE_PAGE, int) and TRADE_PAGE > 0 else 500
+    limit = min(limit, 1000)
+    params = {
+        "condition": str(cond),
+        "limit": str(limit),
+        "taker_only": "true" if taker_only else "false",
+    }
+    raw, err, truncated = _v2_pages("/v2/trades", params, MAX_TRADE_PAGES)
+    errs = [err] if err else []
+    out, seen = [], set()
+    for row in raw or []:
+        adapted = adapt_trade(row)
+        if not adapted:
+            continue
+        key = (adapted["transactionHash"], adapted["asset"], str(adapted["size"]),
+               str(adapted["price"]), str(adapted["side"] or "").upper(),
+               adapted["proxyWallet"].lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(adapted)
     return out, errs, truncated
+
+
+def get_oi(cond):
+    """Open interest for one condition. Returns (list of {value} or [], error)."""
+    data, err = fetch_json(_v2_url("/v2/oi", {"condition": cond}), ttl=15, retry=True)
+    if not isinstance(data, dict):
+        return None, err or "unexpected oi payload"
+    payload = data.get("data")
+    if payload is None:
+        return [], err
+    if not isinstance(payload, list):
+        return [], err or "unexpected oi payload"
+    return payload, err
+
+
+def adapt_holders(groups):
+    """v2 holder groups -> the {token, holders:[{proxyWallet, amount, ...}]} shape."""
+    merged = {}
+    order = []
+    for grp in groups or []:
+        if not isinstance(grp, dict):
+            continue
+        token = grp.get("token_id")
+        if token is None:
+            continue
+        key = str(token)
+        if key not in merged:
+            merged[key] = []
+            order.append(key)
+        raw_holders = grp.get("holders")
+        if not isinstance(raw_holders, list):
+            continue
+        for h in raw_holders:
+            if not isinstance(h, dict):
+                continue
+            wallet = h.get("proxy_wallet") or ""
+            name = h.get("name") or ""
+            pseudo = h.get("pseudonym") or ""
+            merged[key].append({
+                "proxyWallet": wallet if isinstance(wallet, str) else "",
+                "amount": h.get("amount"),
+                "outcomeIndex": h.get("outcome_index"),
+                "name": name if isinstance(name, str) else "",
+                "pseudonym": pseudo if isinstance(pseudo, str) else "",
+                "asset": str(h.get("token_id") if h.get("token_id") is not None else token),
+            })
+    return [{"token": key, "holders": merged[key]} for key in order]
+
+
+def get_holders(cond, limit=20):
+    """Top holders. Returns (groups or None, errors). None is a documented miss."""
+    lim = limit if isinstance(limit, int) and limit > 0 else 20
+    raw, err, truncated = _v2_pages(
+        "/v2/holders", {"condition": cond, "limit": str(min(lim, 1000))}, HOLDERS_PAGE_CAP)
+    errs = [err] if err else []
+    if truncated:
+        errs.append("holders page cap")
+    if raw is None:
+        return None, errs
+    return adapt_holders(raw), errs
 
 
 def grain_label(seconds):
@@ -550,21 +679,55 @@ def _dedupe_history(rows):
     return [by[t] for t in sorted(by)]
 
 
-def split_history_settlement(points):
-    """Drop the on-chain settlement point from a v2 series.
+def _is_synthetic_settlement(prev, last):
+    """True when `last` is the API's on-chain payout point, not a traded tick.
 
-    A resolved market appends one extra point, resolution_seconds 0, one second
-    after the terminal real tick (also resolution_seconds 0). That payout is not
-    a trader midpoint. An unresolved series ends on a single real tick and is
-    left unchanged. Settlement is only identified once the pages are concatenated,
-    because the API attaches it on the last page only.
+    The payout is resolution_seconds 0. It is either one second after the
+    terminal real tick, or one bucket edge past the last stored row (and the
+    server still appends it when the requested window ends before resolution).
     """
-    if len(points) >= 2:
-        prev, last = points[-2], points[-1]
-        if (prev.get("resolution_seconds") == 0 and last.get("resolution_seconds") == 0
-                and last.get("t") == prev.get("t") + 1):
-            return points[:-1], dict(last)
+    if not isinstance(prev, dict) or not isinstance(last, dict):
+        return False
+    if last.get("resolution_seconds") != 0:
+        return False
+    prev_res = prev.get("resolution_seconds")
+    if prev_res == 0 and last.get("t") == prev.get("t") + 1:
+        return True
+    if isinstance(prev_res, int) and prev_res > 0 and last.get("t") == prev.get("t") + prev_res:
+        return True
+    return False
+
+
+def split_history_settlement(points):
+    """Separate the synthetic settlement point from a concatenated series.
+
+    Identification runs after pages are joined, because the API attaches the
+    payout only on the last page. The caller decides whether that payout may
+    be shown: it leaks the outcome when the window ends before resolution.
+    """
+    if len(points) >= 2 and _is_synthetic_settlement(points[-2], points[-1]):
+        return points[:-1], dict(points[-1])
     return points, None
+
+
+def _without_hidden_settlement(raw, window_end, resolved, resolution_ts):
+    """Drop a payout point that this window is not allowed to reveal.
+
+    A chunk whose exclusive end is at or before resolution time, and any window
+    on a market that is not resolved, must not keep the point. Leaving it in
+    the series makes the last 'midpoint' the 0/1 outcome.
+    """
+    if not raw:
+        return raw
+    window_before = (
+        resolution_ts is not None and window_end is not None and window_end <= resolution_ts
+    )
+    if resolved and not window_before:
+        return raw
+    real, settlement = split_history_settlement(_dedupe_history(raw))
+    if settlement is None:
+        return raw
+    return real
 
 
 def _observed_grain(points):
@@ -608,7 +771,7 @@ def _fetch_history_pages(params):
     return rows, err_out or "price-history page cap"
 
 
-def _fetch_history_window(token, start, end, extra):
+def _fetch_history_window(token, start, end, extra, resolved=False, resolution_ts=None):
     rows = []
     err_out = None
     params = {"token_id": str(token)}
@@ -616,9 +779,11 @@ def _fetch_history_window(token, start, end, extra):
     # interval=max is the whole life; start/end would be a second window form.
     if extra.get("interval"):
         page, err = _fetch_history_pages(params)
+        page = _without_hidden_settlement(page, None, resolved, resolution_ts)
         return page, err
     for c_start, c_end in _history_chunks(start, end):
         page, err = _fetch_history_pages({**params, "start": c_start, "end": c_end})
+        page = _without_hidden_settlement(page, c_end, resolved, resolution_ts)
         if page:
             rows.extend(page)
         if err and _rate_limited(err):
@@ -714,14 +879,15 @@ def _history_result(raw_rows, err, skipped, emptied, via_max):
     return real, err, info
 
 
-def get_history(token, start_ts, end_ts, now=None):
+def get_history(token, start_ts, end_ts, now=None, resolved=False, resolution_ts=None):
     """Price history from Data API v2.
 
     Recent or short windows ask for bucket_seconds=60 over chunks of at most
     15 days, following cursors. A window older than that grain's retention is
     not requested at that grain. An empty page (the API does not substitute a
     coarser grain) falls through 300, then 1800, then interval=max.
-    Returns (midpoint_points, error, info). Settlement is in info, not points.
+    Returns (midpoint_points, error, info). The on-chain settlement is in info,
+    and only when the market is resolved and this window ends after resolution.
     """
     empty = {"grain": None, "grainLabel": None, "settlement": None, "fallback": False,
              "note": None, "source": "Data API v2 prices-history"}
@@ -747,7 +913,8 @@ def get_history(token, start_ts, end_ts, now=None):
         if clock - start > retain:
             skipped.append(grain)
             continue
-        raw, err = _fetch_history_window(token, start, end, {"bucket_seconds": grain})
+        raw, err = _fetch_history_window(
+            token, start, end, {"bucket_seconds": grain}, resolved, resolution_ts)
         if err and _rate_limited(err):
             real, err_out, info = _history_result(raw, err, skipped, emptied, False)
             return real, err_out, info
@@ -758,7 +925,8 @@ def get_history(token, start_ts, end_ts, now=None):
             continue
         emptied.append(grain)
 
-    raw, err = _fetch_history_window(token, start, end, {"interval": "max"})
+    raw, err = _fetch_history_window(
+        token, start, end, {"interval": "max"}, resolved, resolution_ts)
     if err and _rate_limited(err) and not raw:
         real, err_out, info = _history_result(raw, err, skipped, emptied, True)
         return real, err_out, info
@@ -952,39 +1120,7 @@ def analyze(market_id):
     if tick is None or tick <= 0 or tick > 0.1:
         tick = 0.0001
 
-    # ---- parallel fetch ----
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        f_books = [ex.submit(fetch_json, f"{CLOB}/book?token_id={t}", 5) for t in tokens]
-        f_trades = ex.submit(get_trades, cond, True)
-        f_fills = ex.submit(get_trades, cond, False)
-        enc_cond = urllib.parse.quote(cond, safe="")
-        f_oi = ex.submit(fetch_json, f"{DATA}/oi?market={enc_cond}", 15)
-        f_hold = ex.submit(fetch_json, f"{DATA}/holders?market={enc_cond}&limit=20", 30)
-        hist_start = created or (now - 30 * 86400)
-        f_hist = [ex.submit(get_history, t, hist_start, now, now) for t in tokens]
-        books_raw = [f.result() for f in f_books]
-        trades_raw, trade_errs, trade_trunc = f_trades.result()
-        fills_raw, fill_errs, fill_trunc = f_fills.result()
-        oi_raw, oi_err = f_oi.result()
-        hold_raw, hold_err = f_hold.result()
-        hists = [f.result() for f in f_hist]
-
-    books, book_errs = [], []
-    for data, e in books_raw:
-        books.append(data if isinstance(data, dict) else None)
-        if e:
-            book_errs.append(e)
-    book_available = any(b is not None for b in books)
-    if tokens and not book_available:
-        detail = "; ".join(sorted({short_err(e) for e in book_errs if e}))
-        extra = f" ({detail})" if detail else ""
-        warnings.append("Order book unavailable" + extra + ". CLOB removes the book once a market closes.")
-    warnings += [f"trades: {short_err(e)}" for e in trade_errs]
-    warnings += [f"maker fills: {short_err(e)}" for e in fill_errs]
-    if trade_trunc or fill_trunc:
-        warnings.append("Trade history hit the pagination cap and may be truncated.")
-
-    # ---- status ----
+    # ---- status (needed before history, so a pre-resolution window cannot leak the payout) ----
     winner = None
     if closed and len(gprices) == 2 and None not in gprices:
         if max(gprices) >= 0.99:
@@ -1003,6 +1139,43 @@ def analyze(market_id):
     if status in ("open", "proposed") and game_ts and now >= game_ts:
         if end_ts and end_ts > game_ts and now < end_ts:
             status_label += " · in play"
+    resolution_ts = None
+    if status == "resolved":
+        resolution_ts = parse_ts(g.get("closedTime")) or parse_ts(g.get("umaEndDate"))
+
+    # ---- parallel fetch ----
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        f_books = [ex.submit(fetch_json, f"{CLOB}/book?token_id={t}", 5) for t in tokens]
+        f_trades = ex.submit(get_trades, cond, True)
+        f_fills = ex.submit(get_trades, cond, False)
+        f_oi = ex.submit(get_oi, cond)
+        f_hold = ex.submit(get_holders, cond, 20)
+        hist_start = created or (now - 30 * 86400)
+        f_hist = [ex.submit(
+            get_history, t, hist_start, now, now, status == "resolved", resolution_ts,
+        ) for t in tokens]
+        books_raw = [f.result() for f in f_books]
+        trades_raw, trade_errs, trade_trunc = f_trades.result()
+        fills_raw, fill_errs, fill_trunc = f_fills.result()
+        oi_raw, oi_err = f_oi.result()
+        hold_raw, hold_errs = f_hold.result()
+        hists = [f.result() for f in f_hist]
+
+    books, book_errs = [], []
+    for data, e in books_raw:
+        books.append(data if isinstance(data, dict) else None)
+        if e:
+            book_errs.append(e)
+    book_available = any(b is not None for b in books)
+    if tokens and not book_available:
+        detail = "; ".join(sorted({short_err(e) for e in book_errs if e}))
+        extra = f" ({detail})" if detail else ""
+        warnings.append("Order book unavailable" + extra + ". CLOB removes the book once a market closes.")
+    warnings += [f"trades: {short_err(e)}" for e in trade_errs]
+    warnings += [f"maker fills: {short_err(e)}" for e in fill_errs]
+    if trade_trunc or fill_trunc:
+        warnings.append("Trade history hit the pagination cap and may be truncated.")
+    hold_err = "; ".join(short_err(e) for e in (hold_errs or []) if e)
 
     # ---- phases ----
     play_end = None
@@ -1046,9 +1219,9 @@ def analyze(market_id):
             trades.append(dict(chosen))
         trades.sort(key=lambda x: x["ts"])
         if trade_errs:
-            warnings.append("Taker trade feed failed; belief uses one fill per transaction from takerOnly=false.")
+            warnings.append("Taker trade feed failed; belief uses one fill per transaction from taker_only=false.")
         else:
-            warnings.append("Taker feed returned no rows; belief uses one fill per transaction from takerOnly=false.")
+            warnings.append("Taker feed returned no rows; belief uses one fill per transaction from taker_only=false.")
     for t in trades:
         t["role"] = "taker"
     taker_keys = {fill_identity(t) for t in trades}
@@ -1623,7 +1796,7 @@ function render(d){
   </div>
 
   <div class="grid g3" style="margin-bottom:16px">
-    <div class="card"><h2>Open interest</h2><div class="big">${s.oi==null?'—':n2(s.oi)}</div><div class="small muted">shares (≈ USD of full sets) · Data API /oi</div></div>
+    <div class="card"><h2>Open interest</h2><div class="big">${s.oi==null?'—':n2(s.oi)}</div><div class="small muted">shares (≈ USD of full sets) · Data API v2 /oi</div></div>
     <div class="card"><h2>Volume (Gamma)</h2><div class="big">${s.volumeGamma==null?'—':n2(s.volumeGamma)}</div><div class="small muted">${s.tradeCount} taker trade(s) + ${s.makerFills||0} maker fills · ${n2(s.tapeShares)} taker shares</div></div>
     <div class="card"><h2>Actual USD spent (size × price)</h2><div class="small muted" style="margin:-6px 0 8px">buy fills only, taker + maker, each side once</div>
       <div style="display:flex;gap:22px"><div><div class="big A">${usd(s.usdByOutcome[A])}</div><div class="small muted">on ${esc(A)} · ${n2(s.sharesBoughtByOutcome[A])} sh</div></div>
