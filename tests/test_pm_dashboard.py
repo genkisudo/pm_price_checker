@@ -19,6 +19,35 @@ YES = "111"
 NO = "222"
 
 
+def v2fill(outcome_index=0, outcome="Yes", side="BUY", size=1, price=0.5,
+           timestamp=1792300000, proxy_wallet="", transaction_hash="", token_id=None,
+           name="", pseudonym=""):
+    """One Data API v2 trade row. No asset field; token_id is the outcome token."""
+    if token_id is None:
+        token_id = NO if outcome_index in (1, "1") else YES
+    return {
+        "proxy_wallet": proxy_wallet,
+        "side": side,
+        "token_id": token_id,
+        "condition_id": COND,
+        "size": size,
+        "price": price,
+        "timestamp": timestamp,
+        "title": "Test market?",
+        "slug": "test-market",
+        "icon": "",
+        "event_slug": "test",
+        "outcome": outcome,
+        "outcome_index": outcome_index,
+        "name": name,
+        "pseudonym": pseudonym,
+        "bio": "",
+        "profile_image": "",
+        "profile_image_optimized": "",
+        "transaction_hash": transaction_hash,
+    }
+
+
 def gamma(**kw):
     base = {
         "id": "100",
@@ -60,6 +89,7 @@ class Router:
         self.fill_pages = {0: []}
         self.oi = []
         self.holders = None
+        self.holder_pages = None
         self.history = {
             YES: [{"timestamp": 1792450158, "price": 0.5, "resolution_seconds": 300}],
             NO: [{"timestamp": 1792450158, "price": 0.5, "resolution_seconds": 300}],
@@ -126,15 +156,46 @@ class Router:
             return {"data": rows, "pagination": {
                 "limit": 10000, "offset": 0, "has_more": False, "next_cursor": None,
             }}, None
-        if path == "/trades":
-            offset = int((qs.get("offset") or ["0"])[0])
-            taker = (qs.get("takerOnly") or ["true"])[0] != "false"
+        if path in ("/trades", "/oi", "/holders"):
+            return None, "HTTP 410 Data API v1 has been retired"
+        if path == "/v2/trades":
+            if "offset" in qs or "market" in qs or "takerOnly" in qs:
+                return None, "HTTP 400 rejected trades param"
+            taker = (qs.get("taker_only") or ["true"])[0] != "false"
+            cursor = (qs.get("cursor") or [""])[0]
             pages = self.taker_pages if taker else self.fill_pages
-            return pages.get(offset, []), None
-        if path == "/oi":
-            return self.oi, None
-        if path == "/holders":
-            return self.holders, None
+            page = pages.get(cursor)
+            if page is None and cursor == "" and 0 in pages:
+                page = pages[0]
+            if page is None:
+                rows, nxt = [], None
+            elif isinstance(page, dict) and "rows" in page:
+                rows, nxt = page.get("rows") or [], page.get("next")
+            else:
+                rows, nxt = page, None
+            return {"data": rows, "pagination": {
+                "limit": len(rows) if isinstance(rows, list) else 0,
+                "offset": 0, "has_more": bool(nxt), "next_cursor": nxt,
+            }}, None
+        if path == "/v2/oi":
+            if "offset" in qs or "market" in qs:
+                return None, "HTTP 400 rejected oi param"
+            return {"data": self.oi}, None
+        if path == "/v2/holders":
+            if "offset" in qs or "market" in qs:
+                return None, "HTTP 400 rejected holders param"
+            cursor = (qs.get("cursor") or [""])[0]
+            if cursor not in ("", "0") and isinstance(self.holder_pages, dict):
+                page = self.holder_pages.get(cursor)
+            else:
+                page = self.holders
+            if isinstance(page, dict) and "rows" in page:
+                rows, nxt = page.get("rows"), page.get("next")
+            else:
+                rows, nxt = page, None
+            return {"data": rows, "pagination": {
+                "limit": 20, "offset": 0, "has_more": bool(nxt), "next_cursor": nxt,
+            }}, None
         return None, f"unmocked {path}"
 
 
@@ -213,11 +274,11 @@ class AnalyzeTest(unittest.TestCase):
         # Bid 0.96 and no ask. Empty side would make spread 0.04, which is NOT a real spread.
         self.router.books[YES] = {"bids": [{"price": "0.96", "size": "10"}], "asks": []}
         self.router.books[NO] = {"bids": [], "asks": []}
-        self.router.taker_pages[0] = [{
-            "outcomeIndex": 0, "outcome": "Yes", "side": "BUY", "size": 5, "price": 0.40,
-            "timestamp": 1792300000, "proxyWallet": "0x" + "aa" * 20,
-            "transactionHash": "0x" + "11" * 32, "asset": YES,
-        }]
+        self.router.taker_pages[0] = [v2fill(
+            outcome_index=0, outcome="Yes", side="BUY", size=5, price=0.40,
+            timestamp=1792300000, proxy_wallet="0x" + "aa" * 20,
+            transaction_hash="0x" + "11" * 32, token_id=YES,
+        )]
         d = self.analyze()
         self.assertFalse(d["book"]["midValid"])
         self.assertLessEqual(d["book"]["spread"], 0.10)
@@ -242,11 +303,11 @@ class AnalyzeTest(unittest.TestCase):
             "bids": [{"price": "0.10", "size": "10"}],
             "asks": [{"price": "0.70", "size": "10"}],
         }
-        self.router.taker_pages[0] = [{
-            "outcomeIndex": "0", "outcome": "Yes", "side": "buy", "size": "8", "price": "0.22",
-            "timestamp": 1792300000, "proxyWallet": "0x" + "ab" * 20,
-            "transactionHash": "0x" + "22" * 32, "asset": YES,
-        }]
+        self.router.taker_pages[0] = [v2fill(
+            outcome_index="0", outcome="Yes", side="buy", size="8", price="0.22",
+            timestamp=1792300000, proxy_wallet="0x" + "ab" * 20,
+            transaction_hash="0x" + "22" * 32, token_id=YES,
+        )]
         d = self.analyze()
         self.assertFalse(d["book"]["midValid"])
         self.assertGreater(d["book"]["spread"], 0.10)
@@ -292,19 +353,18 @@ class AnalyzeTest(unittest.TestCase):
         tx = "0x" + "a1" * 32
         over = "0x" + "11" * 20
         under = "0x" + "22" * 20
-        taker = {
-            "outcome": "Over", "outcomeIndex": 0, "side": "BUY", "size": 1420.52, "price": 0.26,
-            "timestamp": 1792338033, "proxyWallet": over, "transactionHash": tx, "asset": YES,
-            "name": "UpTheBlues",
-        }
-        maker = {
-            "outcome": "Under", "outcomeIndex": 1, "side": "BUY", "size": 1420.52, "price": 0.74,
-            "timestamp": 1792338033, "proxyWallet": under, "transactionHash": tx, "asset": NO,
-            "name": "", "pseudonym": "",
-        }
+        taker = v2fill(
+            outcome="Over", outcome_index=0, side="BUY", size=1420.52, price=0.26,
+            timestamp=1792338033, proxy_wallet=over, transaction_hash=tx, token_id=YES,
+            name="UpTheBlues",
+        )
+        maker = v2fill(
+            outcome="Under", outcome_index=1, side="BUY", size=1420.52, price=0.74,
+            timestamp=1792338033, proxy_wallet=under, transaction_hash=tx, token_id=NO,
+        )
         self.router.taker_pages[0] = [taker]
         self.router.fill_pages[0] = [taker, maker]
-        self.router.oi = [{"market": COND, "value": 0}]
+        self.router.oi = [{"condition_id": COND, "value": 0}]
         d = self.analyze("5733114")
         self.assertEqual(d["market"]["winner"], "Under")
         self.assertEqual(d["market"]["status"], "resolved")
@@ -328,20 +388,20 @@ class AnalyzeTest(unittest.TestCase):
         tx = "0x" + "b2" * 32
         seller = "0x" + "33" * 20
         buyer = "0x" + "44" * 20
-        sell = {
-            "outcome": "Yes", "outcomeIndex": 0, "side": "SELL", "size": 20, "price": 0.026,
-            "timestamp": 1792211118, "proxyWallet": seller, "transactionHash": tx, "asset": YES,
-            "name": "smarterstrat",
-        }
-        buy = {
-            "outcome": "Yes", "outcomeIndex": 0, "side": "BUY", "size": 20, "price": 0.026,
-            "timestamp": 1792211118, "proxyWallet": buyer, "transactionHash": tx, "asset": YES,
-            "name": "buyer",
-        }
+        sell = v2fill(
+            outcome="Yes", outcome_index=0, side="SELL", size=20, price=0.026,
+            timestamp=1792211118, proxy_wallet=seller, transaction_hash=tx, token_id=YES,
+            name="smarterstrat",
+        )
+        buy = v2fill(
+            outcome="Yes", outcome_index=0, side="BUY", size=20, price=0.026,
+            timestamp=1792211118, proxy_wallet=buyer, transaction_hash=tx, token_id=YES,
+            name="buyer",
+        )
         self.router.taker_pages[0] = [sell]
         self.router.fill_pages[0] = [sell, buy]
         self.router.gamma = gamma(volumeNum=20, volume="20", closed=False)
-        self.router.oi = [{"value": 20}]
+        self.router.oi = [{"condition_id": COND, "value": 20}]
         d = self.analyze()
         self.assertEqual(d["stats"]["usdByOutcome"]["Yes"], 0.52)
         self.assertEqual(d["stats"]["sharesBoughtByOutcome"]["Yes"], 20)
@@ -355,12 +415,12 @@ class AnalyzeTest(unittest.TestCase):
             lastTradePrice=0.076, volumeNum=65.46,
         )
         self.router.book_err = "HTTP 404 No orderbook exists"
-        self.router.taker_pages[0] = [{
-            "outcome": "No", "outcomeIndex": 1, "side": "BUY", "size": 65.46, "price": 0.999,
-            "timestamp": 1792319106, "proxyWallet": "0x" + "55" * 20,
-            "transactionHash": "0x" + "c3" * 32, "asset": NO, "name": "taker",
-        }]
-        self.router.oi = [{"value": 0.1}]
+        self.router.taker_pages[0] = [v2fill(
+            outcome="No", outcome_index=1, side="BUY", size=65.46, price=0.999,
+            timestamp=1792319106, proxy_wallet="0x" + "55" * 20,
+            transaction_hash="0x" + "c3" * 32, token_id=NO, name="taker",
+        )]
+        self.router.oi = [{"condition_id": COND, "value": 0.1}]
         d = self.analyze()
         self.assertEqual(d["market"]["winner"], "No")
         self.assertIn("Resolved No", d["verdict"]["headline"])
@@ -368,11 +428,11 @@ class AnalyzeTest(unittest.TestCase):
         self.assertAlmostEqual(d["trades"][0]["priceA"], 0.001, places=3)
 
     def test_string_outcome_index_without_name_or_asset(self):
-        self.router.taker_pages[0] = [{
-            "outcomeIndex": "0", "side": "BUY", "size": 4, "price": 0.3,
-            "timestamp": 1792300000, "proxyWallet": "0x" + "66" * 20,
-            "transactionHash": "0x" + "d4" * 32,
-        }]
+        self.router.taker_pages[0] = [v2fill(
+            outcome_index="0", outcome="", side="BUY", size=4, price=0.3,
+            timestamp=1792300000, proxy_wallet="0x" + "66" * 20,
+            transaction_hash="0x" + "d4" * 32, token_id=YES,
+        )]
         d = self.analyze()
         self.assertEqual(d["trades"][0]["outcome"], "Yes")
         self.assertEqual(d["trades"][0]["outcomeIndex"], 0)
@@ -381,18 +441,18 @@ class AnalyzeTest(unittest.TestCase):
         self.router.gamma = gamma(outcomes=json.dumps(["Yes", "No", "Draw"]))
         self.router.taker_pages[0] = [
             "nope",
-            {"outcomeIndex": 2, "outcome": "Draw", "side": "BUY", "size": 9, "price": 0.2,
-             "timestamp": 1792300000, "asset": "999", "transactionHash": "0x" + "e5" * 32,
-             "proxyWallet": "0x" + "77" * 20},
-            {"outcomeIndex": 0, "outcome": "Yes", "side": "BUY", "size": -1, "price": 0.2,
-             "timestamp": 1792300000, "transactionHash": "0x" + "e6" * 32,
-             "proxyWallet": "0x" + "77" * 20},
-            {"outcomeIndex": 0, "outcome": "Yes", "side": "BUY", "size": 3, "price": 1.4,
-             "timestamp": 1792300000, "transactionHash": "0x" + "e7" * 32,
-             "proxyWallet": "0x" + "77" * 20},
-            {"outcomeIndex": 1, "outcome": "No", "side": "BUY", "size": 3, "price": 0.7,
-             "timestamp": "1792300000000", "transactionHash": "0x" + "e8" * 32,
-             "proxyWallet": "0x" + "88" * 20, "asset": NO},
+            v2fill(outcome_index=2, outcome="Draw", side="BUY", size=9, price=0.2,
+                   timestamp=1792300000, token_id="999", transaction_hash="0x" + "e5" * 32,
+                   proxy_wallet="0x" + "77" * 20),
+            v2fill(outcome_index=0, outcome="Yes", side="BUY", size=-1, price=0.2,
+                   timestamp=1792300000, transaction_hash="0x" + "e6" * 32,
+                   proxy_wallet="0x" + "77" * 20),
+            v2fill(outcome_index=0, outcome="Yes", side="BUY", size=3, price=1.4,
+                   timestamp=1792300000, transaction_hash="0x" + "e7" * 32,
+                   proxy_wallet="0x" + "77" * 20),
+            v2fill(outcome_index=1, outcome="No", side="BUY", size=3, price=0.7,
+                   timestamp="1792300000000", transaction_hash="0x" + "e8" * 32,
+                   proxy_wallet="0x" + "88" * 20, token_id=NO),
         ]
         d = self.analyze()
         self.assertTrue(any("!= 2 outcomes" in w for w in d["warnings"]))
@@ -403,12 +463,12 @@ class AnalyzeTest(unittest.TestCase):
     def test_closed_not_resolved_uses_close_explanation(self):
         self.router.gamma = gamma(closed=True, umaResolutionStatus="", volumeNum=100, volume="100",
                                   outcomePrices=json.dumps(["0.40", "0.60"]))
-        self.router.oi = [{"value": 40}]
-        self.router.taker_pages[0] = [{
-            "outcomeIndex": 0, "outcome": "Yes", "side": "BUY", "size": 10, "price": 0.4,
-            "timestamp": 1792300000, "proxyWallet": "0x" + "99" * 20,
-            "transactionHash": "0x" + "f1" * 32, "asset": YES,
-        }]
+        self.router.oi = [{"condition_id": COND, "value": 40}]
+        self.router.taker_pages[0] = [v2fill(
+            outcome_index=0, outcome="Yes", side="BUY", size=10, price=0.4,
+            timestamp=1792300000, proxy_wallet="0x" + "99" * 20,
+            transaction_hash="0x" + "f1" * 32, token_id=YES,
+        )]
         d = self.analyze()
         self.assertEqual(d["market"]["status"], "closed")
         self.assertNotIn("redeem", d["stats"]["explanation"])
@@ -451,10 +511,16 @@ class AnalyzeTest(unittest.TestCase):
 
     def test_oi_and_holders_bad_payloads_do_not_crash(self):
         self.router.oi = ["nope"]
-        self.router.holders = ["nope", {"token": YES, "holders": [
+        self.router.holders = ["nope", {"token_id": YES, "holders": [
             "bad",
-            {"proxyWallet": "0x" + "ab" * 20, "amount": "12.5", "outcomeIndex": "0", "name": "Ada"},
-            {"proxyWallet": "not-an-address", "amount": -3, "outcomeIndex": 0},
+            {"proxy_wallet": "0x" + "ab" * 20, "amount": "12.5", "outcome_index": "0",
+             "name": "Ada", "pseudonym": "", "token_id": YES, "bio": "",
+             "display_username_public": True, "profile_image": "",
+             "profile_image_optimized": "", "verified": False},
+            {"proxy_wallet": "not-an-address", "amount": -3, "outcome_index": 0,
+             "name": "", "pseudonym": "", "token_id": YES, "bio": "",
+             "display_username_public": False, "profile_image": "",
+             "profile_image_optimized": "", "verified": False},
         ]}]
         d = self.analyze()
         self.assertIsNone(d["stats"]["oi"])
@@ -504,11 +570,11 @@ class AnalyzeTest(unittest.TestCase):
             gameStartTime=start, endDate="2026-10-18T20:00:00Z", closed=False,
         )
         def trade(ts, n):
-            return {
-                "outcomeIndex": 0, "outcome": "Yes", "side": "BUY", "size": 1, "price": 0.4,
-                "timestamp": ts, "proxyWallet": "0x" + f"{n:040x}"[-40:],
-                "transactionHash": "0x" + f"{n:064x}"[-64:], "asset": YES,
-            }
+            return v2fill(
+                outcome_index=0, outcome="Yes", side="BUY", size=1, price=0.4,
+                timestamp=ts, proxy_wallet="0x" + f"{n:040x}"[-40:],
+                transaction_hash="0x" + f"{n:064x}"[-64:], token_id=YES,
+            )
         self.router.taker_pages[0] = [
             trade(game - 60, 1),
             trade(game + 3 * 3600, 2),
@@ -527,34 +593,50 @@ class AnalyzeTest(unittest.TestCase):
         self.assertEqual([t["phase"] for t in d["trades"]], ["in-play", "post-end"])
 
     def test_pagination_dedup_and_cap(self):
-        old_page, old_max = pm.TRADE_PAGE, pm.MAX_TRADE_OFFSET
+        old_page, old_max = pm.TRADE_PAGE, pm.MAX_TRADE_PAGES
         try:
             pm.TRADE_PAGE = 2
-            pm.MAX_TRADE_OFFSET = 10
+            pm.MAX_TRADE_PAGES = 5
             def row(n):
-                return {
-                    "outcomeIndex": 0, "outcome": "Yes", "side": "BUY", "size": 1, "price": 0.4,
-                    "timestamp": 1792300000 + n, "proxyWallet": "0x" + f"{n:040x}"[-40:],
-                    "transactionHash": "0x" + f"{n:064x}"[-64:], "asset": YES,
-                }
-            self.router.taker_pages = {0: [row(1), row(2)], 2: [row(2), row(3)], 4: [row(4)]}
-            self.router.fill_pages = {0: []}
+                return v2fill(
+                    outcome_index=0, outcome="Yes", side="BUY", size=1, price=0.4,
+                    timestamp=1792300000 + n, proxy_wallet="0x" + f"{n:040x}"[-40:],
+                    transaction_hash="0x" + f"{n:064x}"[-64:], token_id=YES,
+                )
+            self.router.taker_pages = {
+                "": {"rows": [row(1), row(2)], "next": "c2"},
+                "c2": {"rows": [row(2), row(3)], "next": "c3"},
+                "c3": {"rows": [row(4)], "next": None},
+            }
+            self.router.fill_pages = {"": {"rows": [], "next": None}}
             d = self.analyze()
             self.assertEqual(d["stats"]["tradeCount"], 4)
             self.assertFalse(any("pagination cap" in w for w in d["warnings"]))
+            trade_urls = [u for u in self.router.urls if "/v2/trades" in u]
+            self.assertTrue(any("cursor=c2" in u for u in trade_urls))
+            self.assertTrue(all("offset=" not in u and "market=" not in u for u in trade_urls))
+            self.assertTrue(any("taker_only=false" in u for u in trade_urls))
+            self.assertTrue(any("taker_only=true" in u for u in trade_urls))
+            self.assertFalse(any(u.split("polymarket.com", 1)[-1].startswith("/trades") for u in self.router.urls))
 
-            self.router.taker_pages = {0: [row(1), row(1)], 2: [row(1), row(1)]}
+            self.router.taker_pages = {
+                "": {"rows": [row(1), row(1)], "next": "c2"},
+                "c2": {"rows": [row(1), row(1)], "next": None},
+            }
             d = self.analyze()
             self.assertEqual(d["stats"]["tradeCount"], 1)
 
-            pm.MAX_TRADE_OFFSET = 0
-            self.router.taker_pages = {i: [row(i + 1), row(i + 2)] for i in range(0, 20, 2)}
+            pm.MAX_TRADE_PAGES = 1
+            self.router.taker_pages = {
+                "": {"rows": [row(1), row(2)], "next": "more"},
+                "more": {"rows": [row(3), row(4)], "next": "more2"},
+            }
             d = self.analyze()
             self.assertTrue(any("pagination cap" in w for w in d["warnings"]))
             self.assertLess(d["stats"]["tradeCount"], 10)
         finally:
             pm.TRADE_PAGE = old_page
-            pm.MAX_TRADE_OFFSET = old_max
+            pm.MAX_TRADE_PAGES = old_max
 
     def test_taker_feed_failure_uses_one_fill_per_tx(self):
         tx = "0x" + "ab" * 32
@@ -565,7 +647,7 @@ class AnalyzeTest(unittest.TestCase):
         orig = self.router
 
         def fetch(url, ttl=10, retry=False):
-            if "/trades?" in url and "takerOnly=false" not in url:
+            if "/v2/trades?" in url and "taker_only=false" not in url:
                 return None, "HTTP 500 down"
             return orig(url, ttl, retry=retry)
         self.router.taker_pages = {0: []}
@@ -573,10 +655,10 @@ class AnalyzeTest(unittest.TestCase):
         a = "0x" + "12" * 20
         b = "0x" + "34" * 20
         self.router.fill_pages[0] = [
-            {"outcomeIndex": 0, "outcome": "Over", "side": "BUY", "size": 10, "price": 0.3,
-             "timestamp": 1792300000, "proxyWallet": a, "transactionHash": tx, "asset": YES},
-            {"outcomeIndex": 1, "outcome": "Under", "side": "BUY", "size": 10, "price": 0.7,
-             "timestamp": 1792300000, "proxyWallet": b, "transactionHash": tx, "asset": NO},
+            v2fill(outcome_index=0, outcome="Over", side="BUY", size=10, price=0.3,
+                   timestamp=1792300000, proxy_wallet=a, transaction_hash=tx, token_id=YES),
+            v2fill(outcome_index=1, outcome="Under", side="BUY", size=10, price=0.7,
+                   timestamp=1792300000, proxy_wallet=b, transaction_hash=tx, token_id=NO),
         ]
         self.router.gamma = gamma(outcomes=json.dumps(["Over", "Under"]))
         d = self.analyze()
@@ -686,7 +768,7 @@ class HistoryTest(unittest.TestCase):
                 _pt(int(start) + 201, 1.0, 0),
             ]),
         }
-        pts, err, info = pm.get_history(YES, start, now, now)
+        pts, err, info = pm.get_history(YES, start, now, now, resolved=True, resolution_ts=start - 10)
         self.assertIsNone(err)
         self.assertEqual([p["p"] for p in pts], [0.40, 0.41, 0.42, 0.55])
         self.assertEqual(info["settlement"]["p"], 1.0)
@@ -749,6 +831,34 @@ class HistoryTest(unittest.TestCase):
             self.assertNotIn("offset", qs)
         self.assertGreaterEqual(len(spans), 2)
         self.assertLessEqual(max(spans), 15 * 86400)
+
+    def test_pre_resolution_window_drops_the_leaked_settlement(self):
+        # Live shape: last stored bucket, then one bucket edge later a 0/1 payout
+        # with resolution_seconds 0, even though this window ends before resolution.
+        now = 1_800_000_000.0
+        start = now - 2 * 86400
+        bucket = int(start) + 300
+        self.router.history_buckets = {
+            "60": {YES: [
+                _pt(bucket, 0.325, 300),
+                _pt(bucket + 300, 1.0, 0),
+            ]},
+        }
+        # Grain 60 is eligible (window is 2 days). The rows above say resolution 300
+        # on the first point so the payout is one bucket edge past it.
+        pts, err, info = pm.get_history(
+            YES, start, now, now, resolved=False, resolution_ts=now + 86400)
+        self.assertIsNone(err)
+        self.assertEqual([p["p"] for p in pts], [0.325])
+        self.assertIsNone(info["settlement"])
+        self.assertNotIn(1.0, [p["p"] for p in pts])
+
+        pts, err, info = pm.get_history(
+            YES, start, now, now, resolved=True, resolution_ts=start - 10)
+        self.assertIsNone(err)
+        self.assertEqual([p["p"] for p in pts], [0.325])
+        self.assertEqual(info["settlement"]["p"], 1.0)
+        self.assertEqual(info["settlement"]["resolution_seconds"], 0)
 
     def test_fractional_settlement_is_split_and_a_lone_tick_is_kept(self):
         real, settle = pm.split_history_settlement([
@@ -832,7 +942,9 @@ class HelperTest(unittest.TestCase):
     def test_allowed_urls(self):
         self.assertTrue(pm._allowed_url("https://gamma-api.polymarket.com/markets/1"))
         self.assertTrue(pm._allowed_url("https://clob.polymarket.com/book?token_id=1"))
-        self.assertTrue(pm._allowed_url("https://data-api.polymarket.com/trades?market=0xab"))
+        self.assertTrue(pm._allowed_url("https://data-api.polymarket.com/v2/trades?condition=0xab&taker_only=false"))
+        self.assertTrue(pm._allowed_url("https://data-api.polymarket.com/v2/oi?condition=0xab"))
+        self.assertTrue(pm._allowed_url("https://data-api.polymarket.com/v2/holders?condition=0xab"))
         self.assertTrue(pm._allowed_url(
             "https://data-api.polymarket.com/v2/prices-history?token_id=1&bucket_seconds=60&start=1&end=2"))
         for bad in (
